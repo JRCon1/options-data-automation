@@ -39,7 +39,7 @@ def get_options(ticker_symbol: str,
         lo, hi      = round(spot * (1 - bound), 0), round(spot * (1 + bound), 0)
         cutoff_date = datetime.utcnow() + timedelta(days=max_dte)
         eastern     = pytz.timezone('US/Eastern')
-        timestamp   = datetime.now(eastern).replace(microsecond=0)
+        timestamp   = datetime.now(eastern).replace(microsecond=0).replace(tzinfo=None)
 
         rows = []
         for exp_str in tk.options:
