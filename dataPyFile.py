@@ -5,6 +5,9 @@ import yfinance as yf
 import openpyxl
 from datetime import datetime, timedelta
 import os
+import pytz
+import numpy as np
+from scipy.stats import norm
 
 # ── Configuration ──────────────────────────────────────────────
 TICKERS   = ["SPY", "UPRO"]
@@ -35,7 +38,8 @@ def get_options(ticker_symbol: str,
 
         lo, hi      = round(spot * (1 - bound), 0), round(spot * (1 + bound), 0)
         cutoff_date = datetime.utcnow() + timedelta(days=max_dte)
-        timestamp   = datetime.now().replace(microsecond=0)
+        eastern     = pytz.timezone('US/Eastern')
+        timestamp   = datetime.now(eastern).replace(microsecond=0)
 
         rows = []
         for exp_str in tk.options:
@@ -62,11 +66,93 @@ def get_options(ticker_symbol: str,
         out        = pd.concat(rows, ignore_index=True)
         now        = pd.Timestamp.now(tz=None)
         out["dte"] = (out["expiry"] - now).dt.days + 1
-        return out[out["dte"] > 0]
+        out = out[out["dte"] > 0]
+        
+        # Calculate Greeks if we have valid data
+        if not out.empty:
+            out = calculate_greeks(out, opt_type)
+            
+        return out
         
     except Exception as e:
         print(f"❌ Error fetching options for {ticker_symbol}: {e}")
         return pd.DataFrame()
+
+def calculate_greeks(data: pd.DataFrame, opt_type: str) -> pd.DataFrame:
+    """
+    Calculate option Greeks for the given data.
+    
+    Args:
+        data: DataFrame with options data
+        opt_type: 'c' for calls, 'p' for puts
+        
+    Returns:
+        DataFrame with Greeks added
+    """
+    try:
+        # Filter out options with implied volatility <= 0.000010
+        data = data[data['impliedVolatility'] > 0.000010].copy()
+        
+        if data.empty:
+            return data
+        
+        # Extract time portion into new 'time' column (HH:MM:SS)
+        data['time'] = data['downloaded_at'].dt.strftime('%H:%M:%S')
+        
+        # Convert dte to years
+        data['t'] = data['dte'] / 365.0
+        
+        # Risk-free rate (using 4.5% as in your example)
+        r = 0.045
+        
+        # Calculate d1
+        data['d1'] = (
+            np.log(data['underlying_price'] / data['strike']) +
+            (r + (data['impliedVolatility'] ** 2) / 2) * data['t']
+        ) / (data['impliedVolatility'] * np.sqrt(data['t']))
+        
+        # Calculate d2
+        data['d2'] = data['d1'] - data['impliedVolatility'] * np.sqrt(data['t'])
+        
+        # Calculate Greeks based on option type
+        if opt_type == 'c':  # Calls
+            # Delta: N(d1)
+            data['delta'] = norm.cdf(data['d1']).round(4)
+            
+            # Theta (per day): [-S * σ * N'(d1) / (2 * sqrt(T)) - r * K * e^(-rT) * N(d2)] / 365
+            data['theta'] = ((
+                - (data['underlying_price'] * data['impliedVolatility'] * norm.pdf(data['d1'])) / (2 * np.sqrt(data['t'])) -
+                r * data['strike'] * np.exp(-r * data['t']) * norm.cdf(data['d2'])
+            ) / 365.0).round(4)
+            
+        else:  # Puts
+            # Delta: N(d1) - 1
+            data['delta'] = (norm.cdf(data['d1']) - 1).round(4)
+            
+            # Theta (per day): [-S * σ * N'(d1) / (2 * sqrt(T)) + r * K * e^(-rT) * N(-d2)] / 365
+            data['theta'] = ((
+                - (data['underlying_price'] * data['impliedVolatility'] * norm.pdf(data['d1'])) / (2 * np.sqrt(data['t'])) +
+                r * data['strike'] * np.exp(-r * data['t']) * norm.cdf(-data['d2'])
+            ) / 365.0).round(4)
+        
+        # Gamma: N'(d1) / (S * σ * sqrt(T)) - same for calls and puts
+        data['gamma'] = (norm.pdf(data['d1']) / (
+            data['underlying_price'] * data['impliedVolatility'] * np.sqrt(data['t'])
+        )).round(4)
+        
+        # Vega (per 1% volatility): S * sqrt(T) * N'(d1) / 100 - same for calls and puts
+        data['vega'] = ((
+            data['underlying_price'] * np.sqrt(data['t']) * norm.pdf(data['d1'])
+        ) / 100.0).round(4)
+        
+        # Drop temporary columns
+        data = data.drop(columns=['t', 'd1', 'd2'])
+        
+        return data
+        
+    except Exception as e:
+        print(f"⚠️  Error calculating Greeks: {e}")
+        return data
 
 def ensure_workbook_exists():
     """Ensure the XLSX workbook exists, create if not."""
@@ -79,13 +165,15 @@ def ensure_workbook_exists():
 
 def main():
     """Main execution function."""
-    print(f"🚀 Starting options data collection at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    eastern = pytz.timezone('US/Eastern')
+    now_et = datetime.now(eastern)
+    print(f"🚀 Starting options data collection at {now_et.strftime('%Y-%m-%d %H:%M:%S %Z')}")
     
     # Ensure workbook exists
     ensure_workbook_exists()
     
     # Generate timestamp for sheet naming
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+    timestamp = now_et.strftime("%Y-%m-%d_%H%M")
     
     # Collect and save data for each ticker and option type
     with pd.ExcelWriter(LOCAL_XLSX, engine="openpyxl", mode="a", if_sheet_exists="overlay") as xl:
@@ -111,6 +199,7 @@ def main():
     
     print(f"🎯 Collection complete! Total rows: {total_rows}")
     print(f"💾 Data saved to: {LOCAL_XLSX}")
+    print(f"⏰ Completed at: {now_et.strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
 if __name__ == "__main__":
     main()
